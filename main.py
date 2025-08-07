@@ -157,32 +157,43 @@ class FPLApp(tk.Tk):
 
     def build_ui(self):
         frm = ttk.Frame(self); frm.pack(fill=tk.X, pady=5)
-        ttk.Label(frm, text="Starting 11 IDs (blank for GW1):").grid(row=0, column=0, sticky=tk.W)
-        self.start_ent = ttk.Entry(frm, width=55); self.start_ent.grid(row=0, column=1)
-        ttk.Label(frm, text="Subs (4 IDs, blank for GW1):").grid(row=1, column=0, sticky=tk.W)
-        self.subs_ent  = ttk.Entry(frm, width=55); self.subs_ent.grid(row=1, column=1)
-        ttk.Label(frm, text="Injured IDs:").grid(row=2, column=0, sticky=tk.W)
-        self.inj_ent   = ttk.Entry(frm, width=55); self.inj_ent.grid(row=2, column=1)
-        ttk.Button(frm, text="Run Model", command=self.run).grid(row=3, column=1, pady=8)
+        ttk.Label(frm, text="Starting 11 IDs (blank for GW1):")\
+            .grid(row=0, column=0, sticky=tk.W)
+        self.start_ent = ttk.Entry(frm, width=55)
+        self.start_ent.grid(row=0, column=1)
+        ttk.Label(frm, text="Subs (4 IDs, blank for GW1):")\
+            .grid(row=1, column=0, sticky=tk.W)
+        self.subs_ent = ttk.Entry(frm, width=55)
+        self.subs_ent.grid(row=1, column=1)
+        ttk.Label(frm, text="Injured IDs:")\
+            .grid(row=2, column=0, sticky=tk.W)
+        self.inj_ent = ttk.Entry(frm, width=55)
+        self.inj_ent.grid(row=2, column=1)
+        ttk.Button(frm, text="Run Model", command=self.run)\
+            .grid(row=3, column=1, pady=8)
 
         self.out_var = tk.StringVar()
-        ttk.Label(self, textvariable=self.out_var, font=("Arial",12)).pack(pady=4)
+        ttk.Label(self, textvariable=self.out_var,
+                  font=("Arial",12)).pack(pady=4)
 
         tf = ttk.LabelFrame(self, text="Transfers & Moves")
         tf.pack(fill=tk.X, padx=10, pady=5)
         self.trans_text = tk.Text(tf, height=6, width=100)
         self.trans_text.pack(fill=tk.X)
 
-        self.make_tree("Previous 15-Squad", "tree_old15")
-        self.make_tree("New Optimized 15-Squad", "tree15")
-        self.make_tree("Optimized Starting 11",  "tree11")
+        self.make_tree("Previous 15-Squad","tree_old15")
+        self.make_tree("New Optimized 15-Squad","tree15")
+        self.make_tree("Optimized Starting 11","tree11")
 
-    def make_tree(self, title, attr):
+    def make_tree(self,title,attr):
         ttk.Label(self, text=title).pack()
-        frame = ttk.Frame(self); frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=3)
+        frame = ttk.Frame(self)
+        frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=3)
         cols = ["ID","Name","Pos","Team","Cost","ExpPts"]
-        tree = ttk.Treeview(frame, columns=cols, show="headings", height=5)
-        vsb  = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        tree = ttk.Treeview(frame, columns=cols,
+                            show="headings", height=5)
+        vsb = ttk.Scrollbar(frame, orient="vertical",
+                            command=tree.yview)
         tree.configure(yscrollcommand=vsb.set)
         for c in cols:
             tree.heading(c, text=c)
@@ -207,10 +218,15 @@ class FPLApp(tk.Tk):
                 messagebox.showerror("Error","IDs must be integers")
                 return
             if len(curr_start)!=11 or len(curr_subs)!=4:
-                messagebox.showerror("Error","Enter 11 start and 4 subs or leave blank"); return
+                messagebox.showerror(
+                    "Error",
+                    "Enter 11 start IDs and 4 subs IDs, or leave blank"
+                )
+                return
 
         curr15 = curr_start + curr_subs
 
+        # fetch & prepare
         players  = fetch_bootstrap()
         fixtures = fetch_fixtures_gw(fetch_current_gw()+1)
         summary  = build_summary_df(players)
@@ -218,34 +234,48 @@ class FPLApp(tk.Tk):
         df       = merge_and_scale(players, exp_df, fixtures)
         df_pool  = df[~df["id"].isin(injured)]
 
-        old15 = df[df["id"].isin(curr15)].copy() if curr15 else pd.DataFrame(columns=df.columns)
+        old15 = df[df["id"].isin(curr15)].copy() \
+               if curr15 else pd.DataFrame(columns=df.columns)
+
         if curr15:
             new15_df = reoptimize_squad(curr15, injured, df_pool)
         else:
             new15_df = select_best_15(df_pool)
 
-        new15_ids = new15_df["id"].tolist()
-        start11_df = select_best_11(new15_df)
+        new15_ids   = new15_df["id"].tolist()
+        start11_df  = select_best_11(new15_df)
 
-        sells, buys, pen = suggest_transfers(curr15, new15_ids, injured, players)
+        sells, buys, pen = suggest_transfers(
+            curr15, new15_ids, injured, players
+        )
 
-        cap_row = start11_df.loc[start11_df["adj_pts"].idxmax()]
+        cap_row = start11_df.loc[
+            start11_df["adj_pts"].idxmax()
+        ]
         cap_name= cap_row["name"]
         gross   = team_score(start11_df["id"].tolist(), new15_df)
         if curr15:
             net = gross - pen
-            self.out_var.set(f"Captain: {cap_name}    Gross pts: {gross:.1f}    Net pts: {net:.1f}")
+            self.out_var.set(
+                f"Captain: {cap_name}    Gross pts: {gross:.1f}"
+                f"    Net pts: {net:.1f}"
+            )
         else:
-            self.out_var.set(f"Captain: {cap_name}    Expected pts: {gross:.1f}")
+            self.out_var.set(
+                f"Captain: {cap_name}    Expected pts: {gross:.1f}"
+            )
 
-        self.trans_text.delete("1.0", tk.END)
+        # show transfers
+        self.trans_text.delete("1.0",tk.END)
         if sells or buys:
-            self.trans_text.insert(tk.END,
+            self.trans_text.insert(
+                tk.END,
                 f"Sell:    {', '.join(sells) or 'None'}\n"
                 f"Buy:     {', '.join(buys)  or 'None'}\n"
                 f"Penalty: {pen} pts"
             )
 
+        # populate tables
         for tree, df_tbl in (
             (self.tree_old15, old15),
             (self.tree15,    new15_df),
@@ -254,14 +284,27 @@ class FPLApp(tk.Tk):
             for iid in tree.get_children():
                 tree.delete(iid)
             for _,r in df_tbl.iterrows():
-                tree.insert("", tk.END, values=(
-                    r["id"],
-                    r["name"],
-                    r["position_id"],
-                    r["team_id"],
-                    f"£{r['cost']/10:.1f}",
-                    f"{r['adj_pts']:.2f}"
-                ))
+                tree.insert(
+                    "", tk.END,
+                    values=(
+                        r["id"],
+                        r["name"],
+                        r["position_id"],
+                        r["team_id"],
+                        f"£{r['cost']/10:.1f}",
+                        f"{r['adj_pts']:.2f}"
+                    )
+                )
+
+        # --- Console export for next week’s inputs ---
+        main11_ids = start11_df["id"].tolist()
+        sub_ids    = [i for i in new15_ids if i not in main11_ids]
+        print()
+        print("=== NEXT WEEK INPUTS ===")
+        print("Starting XI IDs:", ",".join(str(i) for i in main11_ids))
+        print("Subs (4 IDs):",    ",".join(str(i) for i in sub_ids))
+        print("========================")
+
 
 if __name__=="__main__":
     FPLApp().mainloop()
