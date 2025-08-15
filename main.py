@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# FPL 15+Subs Selector — Transfer Logic: GW1 unlimited; GW2+ 1FT with -4/extra
-# Includes numeric coercion fixes and keeps injured players in pool.
+# FPL 15+Subs Selector — XI-Weighted Transfer Logic (with correct fixture difficulties)
+# GW1 unlimited; GW2+ 1FT with -4/extra; keeps injured players in pool.
 
 import tkinter as tk
 from tkinter import ttk, messagebox
@@ -15,6 +15,7 @@ from pulp import (
 BUDGET       = 1000   # £100.0m in tenths
 SQUAD15_SIZE = 15
 START11_SIZE = 11
+BENCH_WEIGHT = 0.25   # weight on bench points vs XI points (0.25–0.40 typical)
 
 # Blend weights for base expected points (ideally sum to 1.0)
 W_EB      = 0.40  # Empirical Bayes from past performance
@@ -47,15 +48,15 @@ def fetch_bootstrap():
     teams_df = pd.DataFrame([{"team_id": t["id"], "club": t["short_name"]} for t in teams])
 
     players_df = pd.DataFrame([{
-        "id":          e["id"],
-        "name":        f"{e['first_name']} {e['second_name']}",
-        "cost":        e["now_cost"],
-        "position_id": e["element_type"],    # 1 GK, 2 DEF, 3 MID, 4 FWD
-        "team_id":     e["team"],
-        "status":      e.get("status"),      # 'a','d','i','s','n'
-        "chance_this": e.get("chance_of_playing_this_round"),
-        "chance_next": e.get("chance_of_playing_next_round"),
-        "minutes":     e.get("minutes", 0),
+        "id":           e["id"],
+        "name":         f"{e['first_name']} {e['second_name']}",
+        "cost":         e["now_cost"],
+        "position_id":  e["element_type"],    # 1 GK, 2 DEF, 3 MID, 4 FWD
+        "team_id":      e["team"],
+        "status":       e.get("status"),      # 'a','d','i','s','n'
+        "chance_this":  e.get("chance_of_playing_this_round"),
+        "chance_next":  e.get("chance_of_playing_next_round"),
+        "minutes":      e.get("minutes", 0),
         "goals_scored": e.get("goals_scored", 0),
         "assists":      e.get("assists", 0),
         "clean_sheets": e.get("clean_sheets", 0),
@@ -73,9 +74,7 @@ def fetch_bootstrap():
     return players_df
 
 def fetch_current_gw():
-    evs = requests.get(
-        "https://fantasy.premierleague.com/api/bootstrap-static/"
-    ).json()["events"]
+    evs = requests.get("https://fantasy.premierleague.com/api/bootstrap-static/").json()["events"]
     for ev in evs:
         if ev.get("is_current"): return ev["id"]
     for ev in evs:
@@ -83,9 +82,7 @@ def fetch_current_gw():
     return 1
 
 def fetch_fixtures_gw(gw):
-    df = pd.DataFrame(requests.get(
-        f"https://fantasy.premierleague.com/api/fixtures/?event={gw}"
-    ).json())
+    df = pd.DataFrame(requests.get(f"https://fantasy.premierleague.com/api/fixtures/?event={gw}").json())
     if df.empty:
         return pd.DataFrame(columns=["team_h","team_h_difficulty","team_a","team_a_difficulty"])
     return df[["team_h","team_h_difficulty","team_a","team_a_difficulty"]]
@@ -94,9 +91,7 @@ def build_summary_df(players_df):
     # Aggregate history to get EB baseline + recent minutes (for availability)
     recs = []
     for pid in players_df["id"]:
-        resp = requests.get(
-            f"https://fantasy.premierleague.com/api/element-summary/{pid}/"
-        ).json()
+        resp = requests.get(f"https://fantasy.premierleague.com/api/element-summary/{pid}/").json()
         past = resp.get("history_past", [])
         if past:
             last = past[-1]
@@ -140,17 +135,21 @@ def merge_and_scale(players_df, exp_df, fixtures1, fixtures2, fixtures3):
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    # ─ fixtures to team-level difficulty (home/away flattened)
-    def build_diff(fx, colname, outcol):
+    # ─ fixtures to team-level difficulty (home/away kept correct) ✅ FIXED
+    def build_diff(fx, outcol):
         if fx.empty:
             return pd.DataFrame(columns=["team_id", outcol])
-        h = fx[["team_h",colname]].rename(columns={"team_h":"team_id", colname:outcol})
-        a = fx[["team_a",colname]].rename(columns={"team_a":"team_id", colname:outcol})
-        return pd.concat([h,a], ignore_index=True)
+        h = fx[["team_h", "team_h_difficulty"]].rename(
+            columns={"team_h": "team_id", "team_h_difficulty": outcol}
+        )
+        a = fx[["team_a", "team_a_difficulty"]].rename(
+            columns={"team_a": "team_id", "team_a_difficulty": outcol}
+        )
+        return pd.concat([h, a], ignore_index=True)
 
-    diff1 = build_diff(fixtures1, "team_h_difficulty", "diff1")
-    diff2 = build_diff(fixtures2, "team_h_difficulty", "diff2")
-    diff3 = build_diff(fixtures3, "team_h_difficulty", "diff3")
+    diff1 = build_diff(fixtures1, "diff1")
+    diff2 = build_diff(fixtures2, "diff2")
+    diff3 = build_diff(fixtures3, "diff3")
 
     df = df.merge(diff1, on="team_id", how="left") \
            .merge(diff2, on="team_id", how="left") \
@@ -202,7 +201,7 @@ def merge_and_scale(players_df, exp_df, fixtures1, fixtures2, fixtures3):
     # ep_next may be string; coerce once
     ep_next = pd.to_numeric(df["ep_next"], errors="coerce").fillna(0.0)
 
-    # ─ base expected points blend (this is what you'll SEE and we SUM for weekly points)
+    # ─ base expected points blend (visible column)
     df["base_ep"] = (W_EB * df["exp_pts_eb"] +
                      W_EP_NEXT * ep_next +
                      W_STAT90 * df["stat_pts90"])
@@ -211,70 +210,116 @@ def merge_and_scale(players_df, exp_df, fixtures1, fixtures2, fixtures3):
     df["position_id"] = pd.to_numeric(df["position_id"], errors="coerce").fillna(0).astype(int)
     df["pos_name"] = df["position_id"].map(POS_MAP).fillna("?")
 
-    # ─ final adjusted points (used internally for picking the squad/XI)
+    # ─ final adjusted points (used for optimisation)
     df["adj_pts"] = df["base_ep"] * df["fixture_mult"] * df["availability_factor"]
     return df
 
-# ── Optimisation Routines ──────────────────────────────────────────────── #
+# ── XI-weighted Optimisation Routines ──────────────────────────────────── #
 
-def select_best_15(df):
-    prob = LpProblem("FPL_15", LpMaximize)
-    x = {i: LpVariable(f"x_{i}", cat=LpBinary) for i in df["id"]}
-    prob += lpSum(df.loc[df["id"]==i,"adj_pts"].item()*x[i] for i in x)
-    prob += lpSum(df.loc[df["id"]==i,"cost"].item()*x[i] for i in x) <= BUDGET
-    prob += lpSum(x.values()) == SQUAD15_SIZE
+def select_best_15(df, bench_weight=BENCH_WEIGHT):
+    """Pick the best 15 while weighting XI points higher than bench points."""
+    prob = LpProblem("FPL_15_XI_weighted", LpMaximize)
+    ids = df["id"].tolist()
+
+    x = {i: LpVariable(f"x_{i}", cat=LpBinary) for i in ids}  # in 15
+    y = {i: LpVariable(f"y_{i}", cat=LpBinary) for i in ids}  # in XI
+
+    adj  = df.set_index("id")["adj_pts"]
+    cost = df.set_index("id")["cost"]
+    pos  = df.set_index("id")["position_id"]
+    team = df.set_index("id")["team_id"]
+
+    # Objective: full weight for XI, discounted for bench
+    prob += lpSum(adj[i]*y[i] + bench_weight*adj[i]*(x[i]-y[i]) for i in ids)
+
+    # Linking & counts
+    prob += lpSum(x[i] for i in ids) == SQUAD15_SIZE
+    prob += lpSum(y[i] for i in ids) == START11_SIZE
+    for i in ids:
+        prob += y[i] <= x[i]  # XI must be from the 15
+
+    # Budget on the 15 only
+    prob += lpSum(cost[i]*x[i] for i in ids) <= BUDGET
+
+    # Position constraints (exact for 15, ranged for XI)
     for pid,(lo,hi) in {1:(2,2),2:(5,5),3:(5,5),4:(3,3)}.items():
-        prob += lpSum(x[i] for i in x
-                      if df.loc[df["id"]==i,"position_id"].iloc[0]==pid) >= lo
-        prob += lpSum(x[i] for i in x
-                      if df.loc[df["id"]==i,"position_id"].iloc[0]==pid) <= hi
-    for tm in df["team_id"].unique():
-        prob += lpSum(x[i] for i in x
-                      if df.loc[df["id"]==i,"team_id"].iloc[0]==tm) <= 3
-    prob.solve(PULP_CBC_CMD(msg=False))
-    chosen = [i for i in x if x[i].value()==1]
-    return df[df["id"].isin(chosen)].copy()
+        prob += lpSum(x[i] for i in ids if pos[i]==pid) >= lo
+        prob += lpSum(x[i] for i in ids if pos[i]==pid) <= hi
+    for pid,(lo,hi) in {1:(1,1),2:(3,5),3:(3,5),4:(1,3)}.items():
+        prob += lpSum(y[i] for i in ids if pos[i]==pid) >= lo
+        prob += lpSum(y[i] for i in ids if pos[i]==pid) <= hi
 
-def reoptimize_squad(curr15, injured, df):
-    old = curr15[:]  # full list
-    prob = LpProblem("FPL_15_reopt", LpMaximize)
-    x = {i: LpVariable(f"x_{i}", cat=LpBinary) for i in df["id"]}
+    # ≤3 per team in the 15
+    for tm in df["team_id"].unique():
+        prob += lpSum(x[i] for i in ids if team[i]==tm) <= 3
+
+    prob.solve(PULP_CBC_CMD(msg=False))
+    chosen15 = [i for i in ids if x[i].value()==1]
+    return df[df["id"].isin(chosen15)].copy()
+
+def reoptimize_squad(curr15, injured, df, bench_weight=BENCH_WEIGHT):
+    """
+    GW2+ re-optimisation with XI weighting and -4 per transfer beyond the first.
+    Locks healthy existing players; allows swaps for injured or upgrades if worth the hit.
+    """
+    old = curr15[:]  # full list of previous ids
+
+    prob = LpProblem("FPL_15_reopt_XI_weighted", LpMaximize)
+    ids = df["id"].tolist()
+
+    x = {i: LpVariable(f"x_{i}", cat=LpBinary) for i in ids}  # in 15
+    y = {i: LpVariable(f"y_{i}", cat=LpBinary) for i in ids}  # in XI
 
     # lock healthy existing players (not in manual injured list)
     for i in set(curr15) - set(injured):
-        prob += x[i] == 1
+        if i in x:
+            prob += x[i] == 1
 
     # transfer indicator for each old player
-    t = {i: LpVariable(f"t_{i}", cat=LpBinary) for i in old}
+    t = {i: LpVariable(f"t_{i}", cat=LpBinary) for i in old if i in x}
     # excess transfers variable
     T_exc = LpVariable("T_exc", lowBound=0, cat=LpInteger)
 
     # t_i = 1 - x_i for each old player (if old player not kept → transfer out)
-    for i in old:
+    for i in t:
         prob += t[i] >= 1 - x[i]
         prob += t[i] <= 1 - x[i]
 
     # penalize beyond 1 free transfer
-    prob += T_exc >= lpSum(t[i] for i in old) - 1
+    prob += T_exc >= lpSum(t[i] for i in t) - 1
     prob += T_exc >= 0
 
-    # objective: adj pts minus 4 * excess transfers
-    prob += lpSum(df.loc[df["id"]==i,"adj_pts"].item()*x[i] for i in x) - 4 * T_exc
+    adj  = df.set_index("id")["adj_pts"]
+    cost = df.set_index("id")["cost"]
+    pos  = df.set_index("id")["position_id"]
+    team = df.set_index("id")["team_id"]
 
-    # squad constraints
-    prob += lpSum(x.values()) == SQUAD15_SIZE
-    prob += lpSum(df.loc[df["id"]==i,"cost"].item()*x[i] for i in x) <= BUDGET
+    # Objective: XI-weighted points minus 4 * excess transfers
+    prob += (lpSum(adj[i]*y[i] + bench_weight*adj[i]*(x[i]-y[i]) for i in ids) - 4 * T_exc)
+
+    # Linking & counts
+    prob += lpSum(x[i] for i in ids) == SQUAD15_SIZE
+    prob += lpSum(y[i] for i in ids) == START11_SIZE
+    for i in ids:
+        prob += y[i] <= x[i]
+
+    # Budget on the 15 only
+    prob += lpSum(cost[i]*x[i] for i in ids) <= BUDGET
+
+    # Position constraints
     for pid,(lo,hi) in {1:(2,2),2:(5,5),3:(5,5),4:(3,3)}.items():
-        prob += lpSum(x[i] for i in x
-                      if df.loc[df["id"]==i,"position_id"].iloc[0]==pid) >= lo
-        prob += lpSum(x[i] for i in x
-                      if df.loc[df["id"]==i,"position_id"].iloc[0]==pid) <= hi
+        prob += lpSum(x[i] for i in ids if pos[i]==pid) >= lo
+        prob += lpSum(x[i] for i in ids if pos[i]==pid) <= hi
+    for pid,(lo,hi) in {1:(1,1),2:(3,5),3:(3,5),4:(1,3)}.items():
+        prob += lpSum(y[i] for i in ids if pos[i]==pid) >= lo
+        prob += lpSum(y[i] for i in ids if pos[i]==pid) <= hi
+
+    # ≤3 per team in the 15
     for tm in df["team_id"].unique():
-        prob += lpSum(x[i] for i in x
-                      if df.loc[df["id"]==i,"team_id"].iloc[0]==tm) <= 3
+        prob += lpSum(x[i] for i in ids if team[i]==tm) <= 3
 
     prob.solve(PULP_CBC_CMD(msg=False))
-    chosen = [i for i in x if x[i].value()==1]
+    chosen = [i for i in ids if x[i].value()==1]
     penalty = int(T_exc.value() * 4)
     return df[df["id"].isin(chosen)].copy(), penalty
 
@@ -314,7 +359,7 @@ def suggest_transfers(old_ids, new_ids, injured_ids, players_df):
 class FPLApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("FPL 15+Subs Selector — Transfer Logic")
+        self.title("FPL 15+Subs Selector — XI-Weighted Transfer Logic")
         self.geometry("1180x860")
         self.build_ui()
 
@@ -353,7 +398,6 @@ class FPLApp(tk.Tk):
     def make_tree(self,title,attr):
         ttk.Label(self, text=title).pack()
         frame = ttk.Frame(self); frame.pack(fill=tk.BOTH,expand=True, padx=10,pady=3)
-        # (Keeping club short name; no team ID column)
         cols = ["ID","Name","Pos","Club","Cost","BaseEP","xG90","xA90","CS90","Saves90","Avail","Fix"]
         widths = [70,220,60,70,70,80,70,70,70,80,70,60]
         tree = ttk.Treeview(frame, columns=cols, show="headings", height=8)
@@ -393,19 +437,17 @@ class FPLApp(tk.Tk):
         exp_df  = compute_empirical_bayes(summary)
         df      = merge_and_scale(players, exp_df, f1, f2, f3)
 
-        # IMPORTANT: keep everyone in pool (do NOT auto-remove injured)
+        # keep everyone in pool (do NOT auto-remove injured)
         df_pool = df.copy()
 
         old15 = df[df["id"].isin(curr15)].copy() \
                if curr15 else pd.DataFrame(columns=df.columns)
 
-        # Transfer logic:
-        # - GW1 (or no current squad): unlimited transfers -> select_best_15
-        # - GW2+: reoptimize with 1FT and -4 per extra (using injured list to unlock)
+        # XI-weighted transfer logic
         if curr15 and gw > 1:
-            new15_df, penalty = reoptimize_squad(curr15, injured, df_pool)
+            new15_df, penalty = reoptimize_squad(curr15, injured, df_pool, bench_weight=BENCH_WEIGHT)
         else:
-            new15_df = select_best_15(df_pool)
+            new15_df = select_best_15(df_pool, bench_weight=BENCH_WEIGHT)
             penalty = 0
 
         new15_ids   = new15_df["id"].tolist()
@@ -459,7 +501,7 @@ class FPLApp(tk.Tk):
                           (self.tree11,    start11_df)):
             fill_tree(tree, tbl)
 
-        # console export
+        # console export for next week
         main11 = start11_df["id"].tolist()
         subs   = [i for i in new15_ids if i not in main11]
         print("\n=== NEXT WEEK INPUTS ===")
