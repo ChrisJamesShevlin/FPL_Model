@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
-# FPL 15+Subs Selector — XI-Weighted Transfer Logic (with correct fixture difficulties)
-# GW1 unlimited; GW2+ 1FT with -4/extra; keeps injured players in pool.
+# FPL — XI-Weighted Optimiser with Proactive Transfers + Robust GW detection
+# - Proactively suggests transfers if XI points improve by ≥ 2 after hits
+# - One free transfer; -4 per additional transfer
+# - Uses fixtures (home/away correct) across next 3 GWs and availability
+# - XI weighting so premiums are prioritised
+# - Robust current GW detection (cache-busted + deadline window + buffer)
+# - Transfer UI shows only the ADOPTED moves (post-threshold), avoiding confusion
 
 import tkinter as tk
 from tkinter import ttk, messagebox
 import requests
 import pandas as pd
+from datetime import datetime, timezone, timedelta
 from pulp import (
     LpProblem, LpVariable, LpMaximize,
     lpSum, LpBinary, LpInteger, PULP_CBC_CMD
@@ -15,7 +21,8 @@ from pulp import (
 BUDGET       = 1000   # £100.0m in tenths
 SQUAD15_SIZE = 15
 START11_SIZE = 11
-BENCH_WEIGHT = 0.25   # weight on bench points vs XI points (0.25–0.40 typical)
+BENCH_WEIGHT = 0.35          # bench points worth 35% of starter points in objective
+NET_GAIN_THRESHOLD = 2.0     # only recommend transfers if net XI gain ≥ 2.0 pts
 
 # Blend weights for base expected points (ideally sum to 1.0)
 W_EB      = 0.40  # Empirical Bayes from past performance
@@ -36,7 +43,6 @@ ASSIST_POINTS = 3
 CS_POINTS_DEF_GK = 4
 SAVES_PER_POINT = 3  # GK: 1pt per 3 saves
 
-# Readable positions
 POS_MAP = {1: "GK", 2: "DEF", 3: "MID", 4: "FWD"}
 
 # ── Data & Model Pipeline ──────────────────────────────────────────────── #
@@ -74,12 +80,32 @@ def fetch_bootstrap():
     return players_df
 
 def fetch_current_gw():
-    evs = requests.get("https://fantasy.premierleague.com/api/bootstrap-static/").json()["events"]
-    for ev in evs:
-        if ev.get("is_current"): return ev["id"]
-    for ev in evs:
-        if ev.get("is_next"):    return ev["id"]
-    return 1
+    """Robust: cache-bust, then use deadline windows with a buffer to pick current GW."""
+    url = "https://fantasy.premierleague.com/api/bootstrap-static/?_=%d" % int(datetime.now().timestamp())
+    js = requests.get(url, headers={"Cache-Control":"no-cache"}).json()
+    evs = js["events"]
+
+    # 1) Prefer explicit is_current
+    cur = next((e for e in evs if e.get("is_current")), None)
+    if cur:
+        return cur["id"]
+
+    # 2) Window-based with buffer
+    now = datetime.now(timezone.utc)
+    buf = timedelta(minutes=10)
+    dts = [datetime.fromisoformat(e["deadline_time"].replace("Z","+00:00")) for e in evs]
+    for i, e in enumerate(evs):
+        start = dts[i] - buf
+        end = dts[i+1] + buf if i+1 < len(evs) else None
+        if (now >= start) and (end is None or now < end):
+            return e["id"]
+
+    # 3) Fallbacks
+    nxt = next((e for e in evs if e.get("is_next")), None)
+    if nxt:
+        return nxt["id"]
+    latest_idx = max(range(len(evs)), key=lambda i: dts[i])
+    return evs[latest_idx]["id"]
 
 def fetch_fixtures_gw(gw):
     df = pd.DataFrame(requests.get(f"https://fantasy.premierleague.com/api/fixtures/?event={gw}").json())
@@ -125,7 +151,7 @@ def compute_empirical_bayes(summary_df):
 def merge_and_scale(players_df, exp_df, fixtures1, fixtures2, fixtures3):
     df = players_df.merge(exp_df, on="id")
 
-    # 🔧 Ensure numeric dtypes (API sometimes returns strings)
+    # Ensure numeric types
     num_cols = [
         "minutes", "xg", "xa", "xgi", "xgc", "saves",
         "clean_sheets", "goals_scored", "assists", "bonus", "bps",
@@ -135,7 +161,7 @@ def merge_and_scale(players_df, exp_df, fixtures1, fixtures2, fixtures3):
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    # ─ fixtures to team-level difficulty (home/away kept correct) ✅ FIXED
+    # Fixture difficulties (home/away correct)
     def build_diff(fx, outcol):
         if fx.empty:
             return pd.DataFrame(columns=["team_id", outcol])
@@ -165,29 +191,25 @@ def merge_and_scale(players_df, exp_df, fixtures1, fixtures2, fixtures3):
         FX_WT_3 * (6 - df["diff3"]) / 5.0
     )
 
-    # ─ availability factor (chance flags + recent minutes)
+    # Availability factor
     raw_chance = df["chance_this"].fillna(df["chance_next"]).fillna(100)
     play_prob = pd.to_numeric(raw_chance, errors="coerce").fillna(100.0) / 100.0
-    play_prob = play_prob.mask(df["status"].isin(["i","s","n"]), 0.0)  # hard zero if out
+    play_prob = play_prob.mask(df["status"].isin(["i","s","n"]), 0.0)  # out = 0
     minutes_factor = (pd.to_numeric(df["mins5"], errors="coerce") / 90.0).clip(0.0, 1.0).fillna(0.0)
     df["availability_factor"] = PLAY_PROB_WT * play_prob + MINUTES_FACTOR_WT * minutes_factor
 
-    # ─ stat model: per90 from xG/xA/CS/Saves (role-aware), null/zero-minute safe
+    # Per90 stat model
     mins = pd.to_numeric(df["minutes"], errors="coerce").astype("Float64").replace(0, pd.NA)
-
     xg90     = (pd.to_numeric(df["xg"], errors="coerce")    / mins * 90).astype("Float64").fillna(0.0)
     xa90     = (pd.to_numeric(df["xa"], errors="coerce")    / mins * 90).astype("Float64").fillna(0.0)
     saves90  = (pd.to_numeric(df["saves"], errors="coerce") / mins * 90).astype("Float64").fillna(0.0)
-
     matches_approx = (mins / 90.0)
     cs_per90 = (pd.to_numeric(df["clean_sheets"], errors="coerce") / matches_approx).astype("Float64").fillna(0.0)
 
     goal_pts = df["position_id"].map(GOAL_POINTS).fillna(4)
     att_pts90 = xg90 * goal_pts + xa90 * ASSIST_POINTS
-
     is_def_or_gk = df["position_id"].isin([1,2])
     cs_pts90 = (cs_per90 * CS_POINTS_DEF_GK).where(is_def_or_gk, 0.0)
-
     is_gk = df["position_id"].eq(1)
     save_pts90 = (saves90 / SAVES_PER_POINT).where(is_gk, 0.0)
 
@@ -195,32 +217,47 @@ def merge_and_scale(players_df, exp_df, fixtures1, fixtures2, fixtures3):
     df["xa90"]    = xa90
     df["cs90"]    = cs_per90.where(is_def_or_gk, 0.0)
     df["saves90"] = saves90.where(is_gk, 0.0)
-
     df["stat_pts90"] = att_pts90 + cs_pts90 + save_pts90
 
-    # ep_next may be string; coerce once
     ep_next = pd.to_numeric(df["ep_next"], errors="coerce").fillna(0.0)
-
-    # ─ base expected points blend (visible column)
     df["base_ep"] = (W_EB * df["exp_pts_eb"] +
                      W_EP_NEXT * ep_next +
                      W_STAT90 * df["stat_pts90"])
 
-    # readable position
     df["position_id"] = pd.to_numeric(df["position_id"], errors="coerce").fillna(0).astype(int)
     df["pos_name"] = df["position_id"].map(POS_MAP).fillna("?")
 
-    # ─ final adjusted points (used for optimisation)
     df["adj_pts"] = df["base_ep"] * df["fixture_mult"] * df["availability_factor"]
     return df
 
-# ── XI-weighted Optimisation Routines ──────────────────────────────────── #
+# ── Optimisation helpers ───────────────────────────────────────────────── #
 
-def select_best_15(df, bench_weight=BENCH_WEIGHT):
-    """Pick the best 15 while weighting XI points higher than bench points."""
+def select_best_11(sub_df):
+    prob = LpProblem("FPL_11", LpMaximize)
+    ids = sub_df["id"].tolist()
+    pos = sub_df.set_index("id")["position_id"]
+    adj = sub_df.set_index("id")["adj_pts"]
+
+    y = {i: LpVariable(f"y_{i}", cat=LpBinary) for i in ids}
+    prob += lpSum(adj[i]*y[i] for i in ids)
+    prob += lpSum(y[i] for i in ids) == START11_SIZE
+
+    for pid,(lo,hi) in {1:(1,1),2:(3,5),3:(3,5),4:(1,3)}.items():
+        prob += lpSum(y[i] for i in ids if pos[i]==pid) >= lo
+        prob += lpSum(y[i] for i in ids if pos[i]==pid) <= hi
+
+    prob.solve(PULP_CBC_CMD(msg=False))
+    chosen = [i for i in ids if y[i].value()==1]
+    df11 = sub_df[sub_df["id"].isin(chosen)].copy()
+    return df11.sort_values(["position_id","adj_pts"], ascending=[True,False])
+
+def xi_points(sub_df):
+    xi = select_best_11(sub_df)
+    return xi["adj_pts"].sum(), xi
+
+def xi_weighted_15(df, bench_weight=BENCH_WEIGHT):
     prob = LpProblem("FPL_15_XI_weighted", LpMaximize)
     ids = df["id"].tolist()
-
     x = {i: LpVariable(f"x_{i}", cat=LpBinary) for i in ids}  # in 15
     y = {i: LpVariable(f"y_{i}", cat=LpBinary) for i in ids}  # in XI
 
@@ -229,19 +266,13 @@ def select_best_15(df, bench_weight=BENCH_WEIGHT):
     pos  = df.set_index("id")["position_id"]
     team = df.set_index("id")["team_id"]
 
-    # Objective: full weight for XI, discounted for bench
     prob += lpSum(adj[i]*y[i] + bench_weight*adj[i]*(x[i]-y[i]) for i in ids)
 
-    # Linking & counts
     prob += lpSum(x[i] for i in ids) == SQUAD15_SIZE
     prob += lpSum(y[i] for i in ids) == START11_SIZE
-    for i in ids:
-        prob += y[i] <= x[i]  # XI must be from the 15
-
-    # Budget on the 15 only
+    for i in ids: prob += y[i] <= x[i]
     prob += lpSum(cost[i]*x[i] for i in ids) <= BUDGET
 
-    # Position constraints (exact for 15, ranged for XI)
     for pid,(lo,hi) in {1:(2,2),2:(5,5),3:(5,5),4:(3,3)}.items():
         prob += lpSum(x[i] for i in ids if pos[i]==pid) >= lo
         prob += lpSum(x[i] for i in ids if pos[i]==pid) <= hi
@@ -249,7 +280,6 @@ def select_best_15(df, bench_weight=BENCH_WEIGHT):
         prob += lpSum(y[i] for i in ids if pos[i]==pid) >= lo
         prob += lpSum(y[i] for i in ids if pos[i]==pid) <= hi
 
-    # ≤3 per team in the 15
     for tm in df["team_id"].unique():
         prob += lpSum(x[i] for i in ids if team[i]==tm) <= 3
 
@@ -257,36 +287,25 @@ def select_best_15(df, bench_weight=BENCH_WEIGHT):
     chosen15 = [i for i in ids if x[i].value()==1]
     return df[df["id"].isin(chosen15)].copy()
 
-def reoptimize_squad(curr15, injured, df, bench_weight=BENCH_WEIGHT):
+def reoptimize_with_transfers(curr15, df, bench_weight=BENCH_WEIGHT):
     """
-    GW2+ re-optimisation with XI weighting and -4 per transfer beyond the first.
-    Locks healthy existing players; allows swaps for injured or upgrades if worth the hit.
+    Proactive transfer engine:
+    - chooses any transfers (0,1,2,...) that maximise XI-weighted points
+    - penalises -4 * (transfers - 1)
     """
-    old = curr15[:]  # full list of previous ids
-
-    prob = LpProblem("FPL_15_reopt_XI_weighted", LpMaximize)
+    old = curr15[:]
+    prob = LpProblem("FPL_15_reopt_with_transfers", LpMaximize)
     ids = df["id"].tolist()
-
-    x = {i: LpVariable(f"x_{i}", cat=LpBinary) for i in ids}  # in 15
+    x = {i: LpVariable(f"x_{i}", cat=LpBinary) for i in ids}  # in 15 after transfers
     y = {i: LpVariable(f"y_{i}", cat=LpBinary) for i in ids}  # in XI
 
-    # lock healthy existing players (not in manual injured list)
-    for i in set(curr15) - set(injured):
-        if i in x:
-            prob += x[i] == 1
-
-    # transfer indicator for each old player
+    # Transfer count relative to old squad
     t = {i: LpVariable(f"t_{i}", cat=LpBinary) for i in old if i in x}
-    # excess transfers variable
     T_exc = LpVariable("T_exc", lowBound=0, cat=LpInteger)
-
-    # t_i = 1 - x_i for each old player (if old player not kept → transfer out)
     for i in t:
         prob += t[i] >= 1 - x[i]
         prob += t[i] <= 1 - x[i]
-
-    # penalize beyond 1 free transfer
-    prob += T_exc >= lpSum(t[i] for i in t) - 1
+    prob += T_exc >= lpSum(t[i] for i in t) - 1  # 1 FT, extras count
     prob += T_exc >= 0
 
     adj  = df.set_index("id")["adj_pts"]
@@ -294,19 +313,13 @@ def reoptimize_squad(curr15, injured, df, bench_weight=BENCH_WEIGHT):
     pos  = df.set_index("id")["position_id"]
     team = df.set_index("id")["team_id"]
 
-    # Objective: XI-weighted points minus 4 * excess transfers
     prob += (lpSum(adj[i]*y[i] + bench_weight*adj[i]*(x[i]-y[i]) for i in ids) - 4 * T_exc)
 
-    # Linking & counts
     prob += lpSum(x[i] for i in ids) == SQUAD15_SIZE
     prob += lpSum(y[i] for i in ids) == START11_SIZE
-    for i in ids:
-        prob += y[i] <= x[i]
-
-    # Budget on the 15 only
+    for i in ids: prob += y[i] <= x[i]
     prob += lpSum(cost[i]*x[i] for i in ids) <= BUDGET
 
-    # Position constraints
     for pid,(lo,hi) in {1:(2,2),2:(5,5),3:(5,5),4:(3,3)}.items():
         prob += lpSum(x[i] for i in ids if pos[i]==pid) >= lo
         prob += lpSum(x[i] for i in ids if pos[i]==pid) <= hi
@@ -314,7 +327,6 @@ def reoptimize_squad(curr15, injured, df, bench_weight=BENCH_WEIGHT):
         prob += lpSum(y[i] for i in ids if pos[i]==pid) >= lo
         prob += lpSum(y[i] for i in ids if pos[i]==pid) <= hi
 
-    # ≤3 per team in the 15
     for tm in df["team_id"].unique():
         prob += lpSum(x[i] for i in ids if team[i]==tm) <= 3
 
@@ -323,29 +335,13 @@ def reoptimize_squad(curr15, injured, df, bench_weight=BENCH_WEIGHT):
     penalty = int(T_exc.value() * 4)
     return df[df["id"].isin(chosen)].copy(), penalty
 
-def select_best_11(sub_df):
-    prob = LpProblem("FPL_11", LpMaximize)
-    y = {i: LpVariable(f"y_{i}", cat=LpBinary) for i in sub_df["id"]}
-    prob += lpSum(sub_df.loc[sub_df["id"]==i,"adj_pts"].item()*y[i] for i in y)
-    prob += lpSum(y.values()) == START11_SIZE
-    for pid,(lo,hi) in {1:(1,1),2:(3,5),3:(3,5),4:(1,3)}.items():
-        prob += lpSum(y[i] for i in y
-                      if sub_df.loc[sub_df["id"]==i,"position_id"].iloc[0]==pid) >= lo
-        prob += lpSum(y[i] for i in y
-                      if sub_df.loc[sub_df["id"]==i,"position_id"].iloc[0]==pid) <= hi
-    prob.solve(PULP_CBC_CMD(msg=False))
-    chosen = [i for i in y if y[i].value()==1]
-    df11 = sub_df[sub_df["id"].isin(chosen)].copy()
-    return df11.sort_values(["position_id","adj_pts"], ascending=[True,False])
-
 def weekly_points_from_baseep(ids, df, triple_captain=False):
-    # Sum BaseEP for starting XI; captain doubles (add +cap); triple adds +2×cap
     base_sum = df.set_index("id").loc[ids,"base_ep"].sum()
     cap      = df.set_index("id").loc[ids,"base_ep"].max()
-    bonus    = (2.0 if triple_captain else 1.0) * cap  # add +1×cap for C, +2×cap for TC
+    bonus    = (2.0 if triple_captain else 1.0) * cap
     return base_sum + bonus
 
-def suggest_transfers(old_ids, new_ids, injured_ids, players_df):
+def suggest_transfers(old_ids, new_ids, players_df):
     old_set = set(old_ids or [])
     new_set = set(new_ids or [])
     sells = old_set - new_set
@@ -359,47 +355,47 @@ def suggest_transfers(old_ids, new_ids, injured_ids, players_df):
 class FPLApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("FPL 15+Subs Selector — XI-Weighted Transfer Logic")
-        self.geometry("1180x860")
+        self.title("FPL — XI-Weighted Optimiser with Proactive Transfers")
+        self.geometry("1180x960")
         self.build_ui()
 
     def build_ui(self):
         frm = ttk.Frame(self); frm.pack(fill=tk.X, pady=5)
-        ttk.Label(frm, text="Starting 11 IDs (blank for GW1):")\
-            .grid(row=0, column=0, sticky=tk.W)
+        ttk.Label(frm, text="Starting 11 IDs (blank for GW1):").grid(row=0, column=0, sticky=tk.W)
         self.start_ent = ttk.Entry(frm, width=60); self.start_ent.grid(row=0, column=1)
-        ttk.Label(frm, text="Subs (4 IDs, blank for GW1):")\
-            .grid(row=1, column=0, sticky=tk.W)
+        ttk.Label(frm, text="Subs (4 IDs, blank for GW1):").grid(row=1, column=0, sticky=tk.W)
         self.subs_ent = ttk.Entry(frm, width=60); self.subs_ent.grid(row=1, column=1)
-        ttk.Label(frm, text="Injured IDs:")\
-            .grid(row=2, column=0, sticky=tk.W)
+        ttk.Label(frm, text="(Optional) Manually mark injured IDs (comma-separated):").grid(row=2, column=0, sticky=tk.W)
         self.inj_ent  = ttk.Entry(frm, width=60); self.inj_ent.grid(row=2, column=1)
+
+        # Manual GW override (optional)
+        ttk.Label(frm, text="Override GW (optional):").grid(row=3, column=0, sticky=tk.W)
+        self.gw_override = ttk.Entry(frm, width=10); self.gw_override.grid(row=3, column=1, sticky=tk.W)
 
         self.tc_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(frm, text="Triple Captain this GW", variable=self.tc_var)\
-            .grid(row=3, column=1, sticky=tk.W, pady=(2,0))
+            .grid(row=4, column=1, sticky=tk.W, pady=(2,0))
 
         ttk.Button(frm, text="Run Model", command=self.run)\
-            .grid(row=4, column=1, pady=8, sticky=tk.W)
+            .grid(row=5, column=1, pady=8, sticky=tk.W)
 
         self.out_var = tk.StringVar()
-        ttk.Label(self, textvariable=self.out_var,
-                  font=("Arial",12)).pack(pady=4)
+        ttk.Label(self, textvariable=self.out_var, font=("Arial",12)).pack(pady=4)
 
-        tf = ttk.LabelFrame(self, text="Transfers & Moves")
+        tf = ttk.LabelFrame(self, text="Transfer Suggestions")
         tf.pack(fill=tk.X, padx=10, pady=5)
-        self.trans_text = tk.Text(tf, height=6, width=140)
+        self.trans_text = tk.Text(tf, height=8, width=140)
         self.trans_text.pack(fill=tk.X)
 
         self.make_tree("Previous 15-Squad","tree_old15")
-        self.make_tree("New Optimized 15-Squad","tree15")
+        self.make_tree("New Optimized 15-Squad (ADOPTED)","tree15")
         self.make_tree("Optimized Starting 11","tree11")
 
     def make_tree(self,title,attr):
         ttk.Label(self, text=title).pack()
         frame = ttk.Frame(self); frame.pack(fill=tk.BOTH,expand=True, padx=10,pady=3)
-        cols = ["ID","Name","Pos","Club","Cost","BaseEP","xG90","xA90","CS90","Saves90","Avail","Fix"]
-        widths = [70,220,60,70,70,80,70,70,70,80,70,60]
+        cols = ["ID","Name","Pos","Club","Cost","BaseEP","xG90","xA90","CS90","Saves90","Avail","Fix","Adj"]
+        widths = [70,220,60,70,70,80,70,70,70,80,70,60,70]
         tree = ttk.Treeview(frame, columns=cols, show="headings", height=8)
         vsb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
         tree.configure(yscrollcommand=vsb.set)
@@ -427,8 +423,14 @@ class FPLApp(tk.Tk):
 
         curr15 = curr_start + curr_subs
 
+        # Determine GW (override optional)
+        gw_txt = (getattr(self, "gw_override", None).get() or "").strip()
+        if gw_txt.isdigit():
+            gw = int(gw_txt)
+        else:
+            gw = fetch_current_gw()
+
         # fetch & prepare
-        gw      = fetch_current_gw()
         players = fetch_bootstrap()
         f1 = fetch_fixtures_gw(gw+1)
         f2 = fetch_fixtures_gw(gw+2)
@@ -437,69 +439,74 @@ class FPLApp(tk.Tk):
         exp_df  = compute_empirical_bayes(summary)
         df      = merge_and_scale(players, exp_df, f1, f2, f3)
 
-        # keep everyone in pool (do NOT auto-remove injured)
+        # Optional manual injury hard-zero
+        if curr15 and i_txt:
+            df.loc[df["id"].isin(injured), "availability_factor"] = 0.0
+            df["adj_pts"] = df["base_ep"] * df["fixture_mult"] * df["availability_factor"]
+
         df_pool = df.copy()
+        old15_df = df[df["id"].isin(curr15)].copy() if curr15 else pd.DataFrame(columns=df.columns)
 
-        old15 = df[df["id"].isin(curr15)].copy() \
-               if curr15 else pd.DataFrame(columns=df.columns)
-
-        # XI-weighted transfer logic
-        if curr15 and gw > 1:
-            new15_df, penalty = reoptimize_squad(curr15, injured, df_pool, bench_weight=BENCH_WEIGHT)
-        else:
-            new15_df = select_best_15(df_pool, bench_weight=BENCH_WEIGHT)
+        if not curr15:
+            # No inputs: just build best 15 (no transfer report)
+            adopted15_df = xi_weighted_15(df_pool, bench_weight=BENCH_WEIGHT)
             penalty = 0
-
-        new15_ids   = new15_df["id"].tolist()
-        start11_df  = select_best_11(new15_df)
-
-        sells, buys = suggest_transfers(curr15, new15_ids, injured, players)
-
-        # Auto-captain = highest BaseEP in XI
-        cap_row = start11_df.loc[start11_df["base_ep"].idxmax()]
-        cap_name= cap_row["name"]
-        triple  = bool(self.tc_var.get())
-
-        # Weekly points OFF BaseEP (Captain double by default; TC triples if checked)
-        weekly  = weekly_points_from_baseep(start11_df["id"].tolist(), new15_df, triple_captain=triple)
-
-        tc_txt = " (Triple Captain)" if triple else ""
-        if curr15 and gw > 1:
-            self.out_var.set(f"GW{gw} — Captain: {cap_name}{tc_txt}    Weekly pts (BaseEP): {weekly:.1f}    Transfer Penalty: {penalty} pts")
+            before_pts = 0.0
+            after_pts  = xi_points(adopted15_df)[0]
         else:
-            self.out_var.set(f"GW{gw} — Captain: {cap_name}{tc_txt}    Expected weekly pts (BaseEP): {weekly:.1f}")
+            # Score current XI
+            before_pts, _ = xi_points(old15_df)
 
-        # show transfers
-        self.trans_text.delete("1.0",tk.END)
-        if sells or buys or penalty:
+            # Candidate via proactive optimiser
+            candidate15_df, candidate_penalty = reoptimize_with_transfers(curr15, df_pool, bench_weight=BENCH_WEIGHT)
+            if gw == 1:
+                candidate_penalty = 0  # GW1 unlimited
+
+            # Score candidate XI
+            after_pts, _ = xi_points(candidate15_df)
+            net_gain = after_pts - before_pts - candidate_penalty
+
+            # Adopt only if it clears the threshold
+            if net_gain >= NET_GAIN_THRESHOLD:
+                adopted15_df = candidate15_df
+                penalty = candidate_penalty
+            else:
+                adopted15_df = old15_df.copy()
+                penalty = 0
+                after_pts = before_pts  # unchanged
+
+        # Build outputs from ADOPTED squad only (to avoid confusion)
+        new15_df  = adopted15_df
+        new15_ids = new15_df["id"].tolist()
+        start11_df = select_best_11(new15_df)
+        sells, buys = suggest_transfers(curr15, new15_ids, players)
+
+        # Header diagnostics
+        cap_name = start11_df.loc[start11_df["base_ep"].idxmax(),"name"] if not start11_df.empty else "—"
+        weekly  = weekly_points_from_baseep(start11_df["id"].tolist(), new15_df, triple_captain=bool(self.tc_var.get()))
+        fixtures_info = f"(fixtures weighted: {gw+1}, {gw+2}, {gw+3}; 1 FT, -4/extra)"
+        self.out_var.set(
+            f"GW{gw} — Captain: {cap_name}    Weekly pts (BaseEP): {weekly:.1f}"
+            f"{'  (GW1: no hit cost)' if gw==1 else ''}    |  {fixtures_info}"
+        )
+
+        # Transfer text
+        self.trans_text.delete("1.0", tk.END)
+        if curr15:
+            net = after_pts - (xi_points(old15_df)[0] if not old15_df.empty else 0.0) - penalty
             self.trans_text.insert(tk.END,
                 f"Sell:    {', '.join(sells) or 'None'}\n"
                 f"Buy:     {', '.join(buys)  or 'None'}\n"
-                f"Penalty: {penalty} pts"
+                f"Penalty: {penalty} pts{' (GW1 unlimited)' if gw == 1 else ''}\n"
+                f"XI gain (adj_pts): before {before_pts:.2f} → after {after_pts:.2f}  Net: {net:+.2f}\n"
+                f"(Transfers only applied if net ≥ {NET_GAIN_THRESHOLD:.1f})"
             )
 
-        # tables (ordered by position then BaseEP)
-        def fill_tree(tree, tbl):
-            for iid in tree.get_children(): tree.delete(iid)
-            view = tbl.sort_values(["position_id","base_ep"], ascending=[True,False])
-            for _,r in view.iterrows():
-                tree.insert("",tk.END,values=(
-                    r["id"], r["name"], r.get("pos_name", "?"),
-                    r.get("club",""),
-                    f"£{r['cost']/10:.1f}",
-                    f"{r['base_ep']:.2f}",
-                    f"{r['xg90']:.2f}",
-                    f"{r['xa90']:.2f}",
-                    f"{r['cs90']:.2f}",
-                    f"{r['saves90']:.2f}",
-                    f"{r['availability_factor']:.2f}",
-                    f"{r['fixture_mult']:.2f}",
-                ))
-
-        for tree, tbl in ((self.tree_old15, old15),
+        # Fill tables
+        for tree, tbl in ((self.tree_old15, old15_df),
                           (self.tree15,    new15_df),
                           (self.tree11,    start11_df)):
-            fill_tree(tree, tbl)
+            self.fill_tree(tree, tbl)
 
         # console export for next week
         main11 = start11_df["id"].tolist()
@@ -509,10 +516,9 @@ class FPLApp(tk.Tk):
         print("Subs (4 IDs):   ", ",".join(map(str,subs)))
         print("========================")
 
-    # small helper to avoid repeating code
-    def fill_tree(self, attr, df):
-        tree = getattr(self, attr)
+    def fill_tree(self, tree, df):
         for iid in tree.get_children(): tree.delete(iid)
+        if df is None or df.empty: return
         view = df.sort_values(["position_id","base_ep"], ascending=[True,False])
         for _,r in view.iterrows():
             tree.insert("",tk.END,values=(
@@ -526,6 +532,7 @@ class FPLApp(tk.Tk):
                 f"{r['saves90']:.2f}",
                 f"{r['availability_factor']:.2f}",
                 f"{r['fixture_mult']:.2f}",
+                f"{r['adj_pts']:.2f}",
             ))
 
 if __name__=="__main__":
