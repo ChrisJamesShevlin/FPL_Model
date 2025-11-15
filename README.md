@@ -1,6 +1,4 @@
-Here’s the updated README with the **entire screenshot section removed** and everything flowing cleanly.
 
----
 
 # **FPL — XI-Weighted Optimiser with Proactive Transfers**
 
@@ -245,6 +243,4 @@ fpl_optimizer.py
 README.md
 ```
 
----
 
-If you want this in **a more compact**, **more visual**, or **more formal** GitHub style — or want badges added — just say.
